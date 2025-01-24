@@ -142,6 +142,9 @@ class TlsConfig:
     #  - ssl_verify_upstream_trusted_ca
     #  - ssl_verify_upstream_trusted_confdir
 
+    def __init__(self):
+        self.h2_domains = {}
+
     def load(self, loader):
         insecure_tls_min_versions = (
             ", ".join(x.name for x in net_tls.INSECURE_TLS_MIN_VERSIONS[:-1])
@@ -272,7 +275,11 @@ class TlsConfig:
         else:
             client_alpn = client.alpn
 
-        has_h2 = check_http2_support(server.address[0], server.address[1])
+        has_h2 = self.h2_domains.get(tls_start.context.client.sni, None)
+        if has_h2 is None:
+            has_h2 = check_http2_support(server.address[0], server.address[1])
+            self.h2_domains[tls_start.context.client.sni] = has_h2
+
         tls_start.ssl_conn.set_app_data(
             AppData(
                 client_alpn=client_alpn,
@@ -302,12 +309,16 @@ class TlsConfig:
         if server.sni is None:
             server.sni = client.sni or server.address[0]
 
-        has_h2 = check_http2_support(server.address[0], server.address[1])
-        if not server.alpn_offers: # server doesnt support ALPN, we offer nothing
-            if not has_h2: # server doesnt supprt h2, we force everyone to talk http1.1
+        has_h2 = self.h2_domains.get(tls_start.context.client.sni, None)
+        if has_h2 is None:
+            has_h2 = check_http2_support(server.address[0], server.address[1])
+            self.h2_domains[tls_start.context.client.sni] = has_h2
+
+        if not server.alpn_offers:  # server doesnt support ALPN, we offer nothing
+            if not has_h2:  # server doesnt supprt h2, we force everyone to talk http1.1
                 server.alpn_offers = tuple([b"http/1.1"])
                 client.alpn_offers = tuple([b"http/1.1"])
-            else: # server supports h2, we offer both
+            else:  # server supports h2, we offer both
                 server.alpn_offers = tuple(client.alpn_offers)
         else:
             server.alpn_offers = []
