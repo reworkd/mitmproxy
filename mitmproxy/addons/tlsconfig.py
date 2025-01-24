@@ -2,7 +2,6 @@ import ipaddress
 import logging
 import os
 import ssl
-import socket
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -113,15 +112,6 @@ def alpn_select_callback(conn: SSL.Connection, options: list[bytes]) -> Any:
     else:
         return SSL.NO_OVERLAPPING_PROTOCOLS
 
-def check_http2_support(sni: str, port: int = 443) -> bool:
-   context = ssl.create_default_context()
-   context.set_alpn_protocols(['h2'])
-   try:
-       with socket.create_connection((sni, port)) as sock:
-           with context.wrap_socket(sock, server_hostname=sni) as ssock:
-               return ssock.selected_alpn_protocol() == 'h2'
-   except Exception as e:
-       return False
 
 class TlsConfig:
     """
@@ -141,9 +131,6 @@ class TlsConfig:
     #  - cert_passphrase
     #  - ssl_verify_upstream_trusted_ca
     #  - ssl_verify_upstream_trusted_confdir
-
-    def __init__(self):
-        self.h2_domains = {}
 
     def load(self, loader):
         insecure_tls_min_versions = (
@@ -275,16 +262,11 @@ class TlsConfig:
         else:
             client_alpn = client.alpn
 
-        has_h2 = self.h2_domains.get(tls_start.context.client.sni, None)
-        if has_h2 is None:
-            has_h2 = check_http2_support(server.address[0], server.address[1])
-            self.h2_domains[tls_start.context.client.sni] = has_h2
-
         tls_start.ssl_conn.set_app_data(
             AppData(
                 client_alpn=client_alpn,
                 server_alpn=server.alpn,
-                http2=has_h2
+                http2=ctx.options.http2,
             )
         )
         tls_start.ssl_conn.set_accept_state()
@@ -309,19 +291,24 @@ class TlsConfig:
         if server.sni is None:
             server.sni = client.sni or server.address[0]
 
-        has_h2 = self.h2_domains.get(tls_start.context.client.sni, None)
-        if has_h2 is None:
-            has_h2 = check_http2_support(server.address[0], server.address[1])
-            self.h2_domains[tls_start.context.client.sni] = has_h2
-
-        if not server.alpn_offers:  # server doesnt support ALPN, we offer nothing
-            if not has_h2:  # server doesnt supprt h2, we force everyone to talk http1.1
-                server.alpn_offers = tuple([b"http/1.1"])
-                client.alpn_offers = tuple([b"http/1.1"])
-            else:  # server supports h2, we offer both
-                server.alpn_offers = tuple(client.alpn_offers)
-        else:
-            server.alpn_offers = []
+        if not server.alpn_offers:
+            if client.alpn_offers:
+                if ctx.options.http2:
+                    # We would perfectly support HTTP/1 -> HTTP/2, but we want to keep things on the same protocol
+                    # version. There are some edge cases where we want to mirror the regular server's behavior
+                    # accurately, for example header capitalization.
+                    server.alpn_offers = tuple(client.alpn_offers)
+                else:
+                    server.alpn_offers = tuple(
+                        x for x in client.alpn_offers if x != b"h2"
+                    )
+            else:
+                # We either have no client TLS or a client without ALPN.
+                # - If the client does use TLS but did not send an ALPN extension, we want to mirror that upstream.
+                # - If the client does not use TLS, there's no clear-cut answer. As a pragmatic approach, we also do
+                #   not send any ALPN extension in this case, which defaults to whatever protocol we are speaking
+                #   or falls back to HTTP.
+                server.alpn_offers = []
 
         if not server.cipher_list and ctx.options.ciphers_server:
             server.cipher_list = ctx.options.ciphers_server.split(":")
